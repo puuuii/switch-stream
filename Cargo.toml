@@ -1,0 +1,15 @@
+[package]
+name = "switch-stream"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+cpal = "0.16"
+crossbeam-channel = "0.5"
+eframe = "0.32"
+egui = "0.32"
+nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
+rayon = "1"
+ringbuf = "0.4"
+rubato = "5.0.0"
