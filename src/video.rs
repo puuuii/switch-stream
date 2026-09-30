@@ -21,6 +21,8 @@ pub type Frame = Vec<Color32>;
 
 const METRICS_WINDOW: Duration = Duration::from_millis(500);
 const MINIMIZED_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const FRAME_ERROR_BACKOFF: Duration = Duration::from_millis(10);
+const TEXTURE_OPTIONS: TextureOptions = TextureOptions::LINEAR;
 
 /// キャプチャスレッドとUIスレッドで共有する統計と、表示の有効/無効フラグ。
 pub struct CaptureStats {
@@ -64,6 +66,23 @@ pub fn spawn_capture(
     profile: &HardwareProfile,
     shutdown: Arc<AtomicBool>,
 ) -> Result<(Receiver<Frame>, Arc<CaptureStats>, JoinHandle<()>)> {
+    let camera = open_camera(profile)?;
+    let spec = profile.video;
+
+    let (tx, rx) = bounded::<Frame>(1);
+    let publisher = LatestFrameSender {
+        tx,
+        drain: rx.clone(),
+    };
+    let stats = CaptureStats::new();
+    let capture_stats = Arc::clone(&stats);
+
+    let handle =
+        thread::spawn(move || capture_loop(camera, spec, publisher, capture_stats, shutdown));
+    Ok((rx, stats, handle))
+}
+
+fn open_camera(profile: &HardwareProfile) -> Result<Camera> {
     let spec = profile.video;
     let desired = CameraFormat::new(
         Resolution::new(spec.width, spec.height),
@@ -83,48 +102,45 @@ pub fn spawn_capture(
             && actual.resolution() == Resolution::new(spec.width, spec.height),
         "Unexpected camera format: {actual:?}"
     );
+    Ok(camera)
+}
 
-    let (width, height) = (spec.width as usize, spec.height as usize);
-    let (tx, rx) = bounded::<Frame>(1);
-    let publisher = LatestFrameSender {
-        tx,
-        drain: rx.clone(),
-    };
-    let stats = CaptureStats::new();
-    let capture_stats = Arc::clone(&stats);
+fn capture_loop(
+    mut camera: Camera,
+    spec: VideoSpec,
+    publisher: LatestFrameSender,
+    stats: Arc<CaptureStats>,
+    shutdown: Arc<AtomicBool>,
+) {
+    let [width, height] = spec.size();
+    // 押し出されて戻ってきたバッファを次のフレームに使い回す(定常状態でのアロケーションを避ける)
+    let mut spare: Option<Frame> = None;
 
-    let handle = thread::spawn(move || {
-        // 押し出されて戻ってきたバッファを次のフレームに使い回す(定常状態でのアロケーションを避ける)
-        let mut spare: Option<Frame> = None;
-
-        while !shutdown.load(Ordering::Relaxed) {
-            let raw = match camera.frame() {
-                Ok(raw) => raw,
-                Err(e) => {
-                    eprintln!("Capture frame error: {e}");
-                    thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-            };
-            capture_stats.captured.fetch_add(1, Ordering::Relaxed);
-
-            // 非表示中はデバイスの読み出しだけ続け、変換と送信を省く。
-            if !capture_stats.display_active.load(Ordering::Relaxed) {
+    while !shutdown.load(Ordering::Relaxed) {
+        let raw = match camera.frame() {
+            Ok(raw) => raw,
+            Err(e) => {
+                eprintln!("Capture frame error: {e}");
+                thread::sleep(FRAME_ERROR_BACKOFF);
                 continue;
             }
+        };
+        stats.captured.fetch_add(1, Ordering::Relaxed);
 
-            let mut pixels = spare
-                .take()
-                .unwrap_or_else(|| vec![Color32::BLACK; width * height]);
-            decode_yuyv(raw.buffer(), &mut pixels, width);
-            spare = publisher.send(pixels);
-            if spare.is_some() {
-                capture_stats.dropped.fetch_add(1, Ordering::Relaxed);
-            }
+        // 非表示中はデバイスの読み出しだけ続け、変換と送信を省く。
+        if !stats.display_active.load(Ordering::Relaxed) {
+            continue;
         }
-    });
 
-    Ok((rx, stats, handle))
+        let mut pixels = spare
+            .take()
+            .unwrap_or_else(|| vec![Color32::BLACK; width * height]);
+        decode_yuyv(raw.buffer(), &mut pixels, width);
+        spare = publisher.send(pixels);
+        if spare.is_some() {
+            stats.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
 }
 
 /// デバイス名の部分一致で映像デバイスを特定する(index変動に強い)。
@@ -198,9 +214,11 @@ impl Metrics {
         let secs = elapsed.as_secs_f32();
         self.capture_fps = (captured - self.captured_base) as f32 / secs;
         self.display_fps = self.displayed as f32 / secs;
-        self.window_start = Instant::now();
-        self.captured_base = captured;
-        self.displayed = 0;
+        *self = Self {
+            capture_fps: self.capture_fps,
+            display_fps: self.display_fps,
+            ..Self::new(captured)
+        };
     }
 }
 
@@ -225,6 +243,53 @@ impl DisplayApp {
             paused: false,
             metrics: Metrics::new(0),
         }
+    }
+
+    /// 最小化中は描画とデコードを止め、復帰時に計測をリセットする。
+    fn handle_minimized(&mut self, ctx: &egui::Context, minimized: bool, captured: u64) -> bool {
+        self.stats
+            .display_active
+            .store(!minimized, Ordering::Relaxed);
+        if minimized {
+            self.paused = true;
+            ctx.request_repaint_after(MINIMIZED_POLL_INTERVAL);
+        } else if self.paused {
+            self.paused = false;
+            self.metrics = Metrics::new(captured);
+        }
+        minimized
+    }
+
+    fn upload_latest_frame(&mut self, ctx: &egui::Context) {
+        // 溜まっているフレームは最新だけ使う。
+        let Some(pixels) = self.rx.try_iter().last() else {
+            return;
+        };
+        self.metrics.displayed += 1;
+
+        let size = self.spec.size();
+        let image = ColorImage {
+            size,
+            source_size: Vec2::new(size[0] as f32, size[1] as f32),
+            pixels,
+        };
+        match &mut self.texture {
+            Some(tex) => tex.set(image, TEXTURE_OPTIONS),
+            None => self.texture = Some(ctx.load_texture("video_frame", image, TEXTURE_OPTIONS)),
+        }
+    }
+
+    fn draw_video(&self, ctx: &egui::Context) {
+        egui::CentralPanel::default()
+            .frame(egui::Frame::NONE)
+            .show(ctx, |ui| match &self.texture {
+                Some(tex) => {
+                    ui.add(egui::Image::new(tex).fit_to_exact_size(ui.available_size()));
+                }
+                None => {
+                    ui.label("Waiting for video...");
+                }
+            });
     }
 
     fn draw_overlay(&self, ctx: &egui::Context) {
@@ -256,19 +321,9 @@ impl DisplayApp {
 impl eframe::App for DisplayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
-        self.stats
-            .display_active
-            .store(!minimized, Ordering::Relaxed);
-        if minimized {
-            self.paused = true;
-            ctx.request_repaint_after(MINIMIZED_POLL_INTERVAL);
-            return;
-        }
-
         let captured = self.stats.captured.load(Ordering::Relaxed);
-        if self.paused {
-            self.paused = false;
-            self.metrics = Metrics::new(captured);
+        if self.handle_minimized(ctx, minimized, captured) {
+            return;
         }
         ctx.request_repaint();
 
@@ -276,37 +331,9 @@ impl eframe::App for DisplayApp {
             self.show_overlay = !self.show_overlay;
         }
 
-        // 溜まっているフレームは最新だけ使う。
-        let latest = self.rx.try_iter().last();
-        if let Some(pixels) = latest {
-            self.metrics.displayed += 1;
-            let (width, height) = (self.spec.width as usize, self.spec.height as usize);
-            let image = ColorImage {
-                size: [width, height],
-                source_size: Vec2::new(width as f32, height as f32),
-                pixels,
-            };
-            match &mut self.texture {
-                Some(tex) => tex.set(image, TextureOptions::LINEAR),
-                None => {
-                    self.texture =
-                        Some(ctx.load_texture("video_frame", image, TextureOptions::LINEAR));
-                }
-            }
-        }
+        self.upload_latest_frame(ctx);
         self.metrics.tick(captured);
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
-            .show(ctx, |ui| match &self.texture {
-                Some(tex) => {
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(ui.available_size()));
-                }
-                None => {
-                    ui.label("Waiting for video...");
-                }
-            });
-
+        self.draw_video(ctx);
         if self.show_overlay {
             self.draw_overlay(ctx);
         }

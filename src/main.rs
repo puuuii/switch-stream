@@ -5,25 +5,32 @@ mod video;
 use hardware::HardwareProfile;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::thread::{self, JoinHandle};
+
+fn spawn_audio(device_keyword: &'static str, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
+    thread::spawn(move || {
+        if let Err(e) = audio::run(device_keyword, shutdown) {
+            eprintln!("Audio pipeline error: {e}");
+        }
+    })
+}
+
+fn join_thread(name: &str, handle: JoinHandle<()>) {
+    if let Err(e) = handle.join() {
+        eprintln!("{name} thread panicked: {e:?}");
+    }
+}
 
 fn main() -> anyhow::Result<()> {
     let profile = HardwareProfile::AVERMEDIA_LIVE_GAMER_MINI_GC311;
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let (rx, stats, capture_handle) = video::spawn_capture(&profile, Arc::clone(&shutdown))?;
+    let audio_handle = spawn_audio(profile.audio_device_keyword, Arc::clone(&shutdown));
 
-    let shutdown_audio = Arc::clone(&shutdown);
-    let audio_handle = thread::spawn(move || {
-        if let Err(e) = audio::run(profile.audio_device_keyword, shutdown_audio) {
-            eprintln!("Audio pipeline error: {e}");
-        }
-    });
-
+    let [width, height] = profile.video.size();
     let options = eframe::NativeOptions {
-        // プロファイルの解像度に追従させる(以前は1920x1080固定でプロファイル変更時にずれていた)
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([profile.video.width as f32, profile.video.height as f32]),
+        viewport: egui::ViewportBuilder::default().with_inner_size([width as f32, height as f32]),
         vsync: false,
         ..Default::default()
     };
@@ -34,13 +41,8 @@ fn main() -> anyhow::Result<()> {
     );
 
     shutdown.store(true, Ordering::Relaxed);
-
-    if let Err(e) = capture_handle.join() {
-        eprintln!("Capture thread panicked: {e:?}");
-    }
-    if let Err(e) = audio_handle.join() {
-        eprintln!("Audio thread panicked: {e:?}");
-    }
+    join_thread("Capture", capture_handle);
+    join_thread("Audio", audio_handle);
 
     result.map_err(|e| anyhow::anyhow!("eframe error: {e}"))
 }

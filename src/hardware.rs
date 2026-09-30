@@ -8,6 +8,12 @@ pub struct VideoSpec {
     pub frame_format: FrameFormat,
 }
 
+impl VideoSpec {
+    pub fn size(&self) -> [usize; 2] {
+        [self.width as usize, self.height as usize]
+    }
+}
+
 /// キャプチャデバイス識別用のキーワード(大文字小文字無視の部分一致)と映像形式。
 #[derive(Debug, Clone, Copy)]
 pub struct HardwareProfile {

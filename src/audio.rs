@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const INPUT_RING_MS: usize = 200;
+const INPUT_RING_MS: f64 = 200.0;
 // 192kHz x 8ch で100ms分。出力フォーマットが変わっても再確保しない。
 const OUTPUT_RING_CAPACITY: usize = 192_000 * 8 / 10;
 const LOW_LATENCY_FRAMES: u32 = 128;
@@ -27,7 +27,6 @@ const DRIFT_GAIN: f64 = 0.01;
 const MAX_DRIFT: f64 = 0.005;
 const FILL_SMOOTHING: f64 = 0.05;
 const WORKER_WAKE_TIMEOUT: Duration = Duration::from_millis(10);
-const FILL_LOG_INTERVAL: Duration = Duration::from_secs(1);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OUTPUT_DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(1000);
 
@@ -35,13 +34,14 @@ fn debug_err(e: impl std::fmt::Debug) -> anyhow::Error {
     anyhow::anyhow!("{e:?}")
 }
 
+/// インターリーブ済みPCMのレートとチャンネル数。入力・出力の双方で使う。
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct OutputSpec {
+struct AudioSpec {
     sample_rate: u32,
     channels: usize,
 }
 
-impl OutputSpec {
+impl AudioSpec {
     fn of(config: &cpal::SupportedStreamConfig) -> Self {
         Self {
             sample_rate: config.sample_rate().0,
@@ -60,24 +60,24 @@ impl OutputSpec {
 }
 
 /// 出力フォーマットをリサンプルスレッドと共有する。レートとチャンネル数を1つのatomicにまとめて整合を保つ。
-struct OutputFormat(AtomicU64);
+struct SharedSpec(AtomicU64);
 
-impl OutputFormat {
-    fn new(spec: OutputSpec) -> Self {
+impl SharedSpec {
+    fn new(spec: AudioSpec) -> Self {
         Self(AtomicU64::new(Self::pack(spec)))
     }
 
-    fn pack(spec: OutputSpec) -> u64 {
+    fn pack(spec: AudioSpec) -> u64 {
         ((spec.sample_rate as u64) << 32) | spec.channels as u64
     }
 
-    fn set(&self, spec: OutputSpec) {
+    fn set(&self, spec: AudioSpec) {
         self.0.store(Self::pack(spec), Ordering::Relaxed);
     }
 
-    fn get(&self) -> OutputSpec {
+    fn get(&self) -> AudioSpec {
         let v = self.0.load(Ordering::Relaxed);
-        OutputSpec {
+        AudioSpec {
             sample_rate: (v >> 32) as u32,
             channels: (v & 0xffff_ffff) as usize,
         }
@@ -91,9 +91,26 @@ struct LatencyProbe {
     output_us: AtomicU64,
 }
 
+impl LatencyProbe {
+    fn record_input(&self, info: &cpal::InputCallbackInfo) {
+        let ts = info.timestamp();
+        if let Some(d) = ts.callback.duration_since(&ts.capture) {
+            self.input_us.store(d.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+
+    fn record_output(&self, info: &cpal::OutputCallbackInfo) {
+        let ts = info.timestamp();
+        if let Some(d) = ts.playback.duration_since(&ts.callback) {
+            self.output_us
+                .store(d.as_micros() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
 /// コールバック・リサンプルスレッド・メインスレッドで共有する状態。
 struct Shared {
-    format: OutputFormat,
+    output_spec: SharedSpec,
     output_active: AtomicBool,
     in_callback_samples: AtomicUsize,
     out_callback_samples: AtomicUsize,
@@ -101,9 +118,9 @@ struct Shared {
 }
 
 impl Shared {
-    fn new(spec: OutputSpec) -> Self {
+    fn new(output: AudioSpec) -> Self {
         Self {
-            format: OutputFormat::new(spec),
+            output_spec: SharedSpec::new(output),
             output_active: AtomicBool::new(false),
             in_callback_samples: AtomicUsize::new(0),
             out_callback_samples: AtomicUsize::new(0),
@@ -111,13 +128,12 @@ impl Shared {
         }
     }
 
-    fn in_period_ms(&self, channels: usize, rate: u32) -> f64 {
-        self.in_callback_samples.load(Ordering::Relaxed) as f64 * 1000.0
-            / (rate as f64 * channels as f64)
+    fn in_period_ms(&self, input: AudioSpec) -> f64 {
+        input.ms_for_samples(self.in_callback_samples.load(Ordering::Relaxed))
     }
 
-    fn out_period_ms(&self, spec: OutputSpec) -> f64 {
-        spec.ms_for_samples(self.out_callback_samples.load(Ordering::Relaxed))
+    fn out_period_ms(&self, output: AudioSpec) -> f64 {
+        output.ms_for_samples(self.out_callback_samples.load(Ordering::Relaxed))
     }
 }
 
@@ -137,8 +153,8 @@ fn push_mapped(
 /// rubatoのsincリサンプラと、出力リングの充填量に基づくドリフト補正。
 struct StreamResampler {
     inner: Async<f32>,
-    in_channels: usize,
-    spec: OutputSpec,
+    input: AudioSpec,
+    output: AudioSpec,
     base_ratio: f64,
     in_buf: Vec<f32>,
     out_buf: Vec<f32>,
@@ -147,8 +163,8 @@ struct StreamResampler {
 }
 
 impl StreamResampler {
-    fn new(in_channels: usize, in_rate: u32, spec: OutputSpec) -> Result<Self> {
-        let base_ratio = spec.sample_rate as f64 / in_rate as f64;
+    fn new(input: AudioSpec, output: AudioSpec) -> Result<Self> {
+        let base_ratio = output.sample_rate as f64 / input.sample_rate as f64;
         let params = SincInterpolationParameters::new(SINC_LEN, WindowFunction::BlackmanHarris2)
             .interpolation(SincInterpolationType::Cubic);
         let inner = Async::<f32>::new_sinc(
@@ -156,27 +172,27 @@ impl StreamResampler {
             MAX_RATIO_RELATIVE,
             &params,
             RESAMPLE_CHUNK_FRAMES,
-            in_channels,
+            input.channels,
             FixedAsync::Input,
         )
         .map_err(debug_err)
         .context("Failed to build resampler")?;
 
-        let target_fill = spec.samples_for_ms(DEFAULT_TARGET_MS);
+        let target_fill = output.samples_for_ms(DEFAULT_TARGET_MS);
         Ok(Self {
-            in_buf: vec![0.0; inner.input_frames_next() * in_channels],
-            out_buf: vec![0.0; inner.output_frames_max() * in_channels],
+            in_buf: vec![0.0; inner.input_frames_next() * input.channels],
+            out_buf: vec![0.0; inner.output_frames_max() * input.channels],
             fill_avg: target_fill as f64,
             target_fill,
             inner,
-            in_channels,
-            spec,
+            input,
+            output,
             base_ratio,
         })
     }
 
     fn set_target_fill(&mut self, samples: usize) {
-        self.target_fill = samples.max(self.spec.channels);
+        self.target_fill = samples.max(self.output.channels);
     }
 
     fn has_chunk(&self, raw: &HeapCons<f32>) -> bool {
@@ -191,9 +207,9 @@ impl StreamResampler {
         if out.occupied_len() > self.target_fill * MAX_FILL_FACTOR {
             return Ok(());
         }
-        let ch = self.in_channels;
+        let ch = self.input.channels;
         for frame in self.out_buf[..produced * ch].chunks_exact(ch) {
-            push_mapped(out, ch, self.spec.channels, |c| frame[c]);
+            push_mapped(out, ch, self.output.channels, |c| frame[c]);
         }
         Ok(())
     }
@@ -210,7 +226,7 @@ impl StreamResampler {
     }
 
     fn resample(&mut self) -> Result<usize> {
-        let ch = self.in_channels;
+        let ch = self.input.channels;
         let input =
             InterleavedSlice::new(&self.in_buf, ch, self.in_buf.len() / ch).map_err(debug_err)?;
         let out_frames = self.out_buf.len() / ch;
@@ -230,91 +246,90 @@ fn prime(out: &mut HeapProd<f32>, samples: usize) {
     }
 }
 
-fn log_latency(
-    shared: &Shared,
-    spec: OutputSpec,
-    in_channels: usize,
-    in_rate: u32,
-    target_fill: usize,
-    raw: &HeapCons<f32>,
-    out: &HeapProd<f32>,
-) {
-    let in_ring_ms = raw.occupied_len() as f64 * 1000.0 / (in_rate as f64 * in_channels as f64);
-    eprintln!(
-        "out ring: {:.1} ms (target {:.1}) | in ring: {:.1} ms | dev in: {:.1} ms | dev out: {:.1} ms | cb in/out: {:.1}/{:.1} ms",
-        spec.ms_for_samples(out.occupied_len()),
-        spec.ms_for_samples(target_fill),
-        in_ring_ms,
-        shared.probe.input_us.load(Ordering::Relaxed) as f64 / 1000.0,
-        shared.probe.output_us.load(Ordering::Relaxed) as f64 / 1000.0,
-        shared.in_period_ms(in_channels, in_rate),
-        shared.out_period_ms(spec),
-    );
+/// リサンプルスレッド上で動く処理本体。入力リング→リサンプル→出力リングを回す。
+struct ResampleTask {
+    raw: HeapCons<f32>,
+    out: HeapProd<f32>,
+    shared: Arc<Shared>,
+    input: AudioSpec,
+    output: AudioSpec,
+    resampler: StreamResampler,
+    primed: bool,
 }
 
-fn resampler_loop(
-    raw: &mut HeapCons<f32>,
-    out: &mut HeapProd<f32>,
-    shared: &Shared,
-    in_channels: usize,
-    in_rate: u32,
-    stop: &AtomicBool,
-) -> Result<()> {
-    let mut spec = shared.format.get();
-    let mut resampler = StreamResampler::new(in_channels, in_rate, spec)?;
-    let mut primed = false;
-    let mut last_log = Instant::now();
+impl ResampleTask {
+    fn new(
+        raw: HeapCons<f32>,
+        out: HeapProd<f32>,
+        shared: Arc<Shared>,
+        input: AudioSpec,
+    ) -> Result<Self> {
+        let output = shared.output_spec.get();
+        Ok(Self {
+            resampler: StreamResampler::new(input, output)?,
+            raw,
+            out,
+            shared,
+            input,
+            output,
+            primed: false,
+        })
+    }
 
-    while !stop.load(Ordering::Relaxed) {
-        // 出力が消費を始めるまでは入力を捨て、リングに遅延を溜め込まない。
-        if !shared.output_active.load(Ordering::Relaxed) {
-            raw.clear();
-            thread::park_timeout(WORKER_WAKE_TIMEOUT);
-            continue;
-        }
-
-        let latest = shared.format.get();
-        if latest != spec {
-            spec = latest;
-            match StreamResampler::new(in_channels, in_rate, spec) {
-                Ok(new) => resampler = new,
-                Err(e) => eprintln!("{e:#}"),
+    fn run(&mut self, stop: &AtomicBool) {
+        while !stop.load(Ordering::Relaxed) {
+            if self.shared.output_active.load(Ordering::Relaxed) {
+                self.step();
+            } else {
+                // 出力が消費を始めるまでは入力を捨て、リングに遅延を溜め込まない。
+                self.raw.clear();
             }
+            thread::park_timeout(WORKER_WAKE_TIMEOUT);
+        }
+    }
+
+    fn step(&mut self) {
+        self.follow_output_spec();
+        self.update_target_fill();
+
+        if !self.primed {
+            prime(&mut self.out, self.resampler.target_fill);
+            self.primed = true;
         }
 
-        // 充填の目標はコールバック周期の半分+余裕。周期が短いほど遅延も短くなる。
-        let period_ms = shared
-            .in_period_ms(in_channels, in_rate)
-            .max(shared.out_period_ms(spec));
-        resampler.set_target_fill(spec.samples_for_ms(period_ms / 2.0 + FILL_MARGIN_MS));
+        self.drain_input();
+    }
 
-        if !primed {
-            prime(out, resampler.target_fill);
-            primed = true;
+    fn follow_output_spec(&mut self) {
+        let latest = self.shared.output_spec.get();
+        if latest == self.output {
+            return;
         }
+        self.output = latest;
+        match StreamResampler::new(self.input, latest) {
+            Ok(new) => self.resampler = new,
+            Err(e) => eprintln!("{e:#}"),
+        }
+    }
 
-        while resampler.has_chunk(raw) {
-            if let Err(e) = resampler.process_chunk(raw, out) {
+    /// 充填の目標はコールバック周期の半分+余裕。周期が短いほど遅延も短くなる。
+    fn update_target_fill(&mut self) {
+        let period_ms = self
+            .shared
+            .in_period_ms(self.input)
+            .max(self.shared.out_period_ms(self.output));
+        let target = self.output.samples_for_ms(period_ms / 2.0 + FILL_MARGIN_MS);
+        self.resampler.set_target_fill(target);
+    }
+
+    fn drain_input(&mut self) {
+        while self.resampler.has_chunk(&self.raw) {
+            if let Err(e) = self.resampler.process_chunk(&mut self.raw, &mut self.out) {
                 eprintln!("Resample error: {e}");
                 break;
             }
         }
-
-        if cfg!(debug_assertions) && last_log.elapsed() >= FILL_LOG_INTERVAL {
-            last_log = Instant::now();
-            log_latency(
-                shared,
-                spec,
-                in_channels,
-                in_rate,
-                resampler.target_fill,
-                raw,
-                out,
-            );
-        }
-        thread::park_timeout(WORKER_WAKE_TIMEOUT);
     }
-    Ok(())
 }
 
 /// リサンプルスレッドの所有者。Drop時に停止してjoinする。
@@ -326,23 +341,17 @@ struct Worker {
 
 impl Worker {
     fn spawn(
-        mut raw: HeapCons<f32>,
-        mut out: HeapProd<f32>,
+        raw: HeapCons<f32>,
+        out: HeapProd<f32>,
         shared: Arc<Shared>,
-        in_channels: usize,
-        in_rate: u32,
+        input: AudioSpec,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop);
         let handle = thread::spawn(move || {
-            if let Err(e) = resampler_loop(
-                &mut raw,
-                &mut out,
-                &shared,
-                in_channels,
-                in_rate,
-                &stop_flag,
-            ) {
+            let result =
+                ResampleTask::new(raw, out, shared, input).map(|mut task| task.run(&stop_flag));
+            if let Err(e) = result {
                 eprintln!("Resampler thread error: {e}");
             }
         });
@@ -370,33 +379,76 @@ impl Drop for Worker {
     }
 }
 
+type SharedConsumer = Arc<Mutex<HeapCons<f32>>>;
+
+/// デフォルト出力デバイスのストリームを保持し、変化を検知したら作り直す。
+struct OutputRouter {
+    host: cpal::Host,
+    consumer: SharedConsumer,
+    shared: Arc<Shared>,
+    device_name: Option<String>,
+    _stream: Stream,
+}
+
+impl OutputRouter {
+    fn start(
+        host: cpal::Host,
+        consumer: SharedConsumer,
+        shared: Arc<Shared>,
+        device: &cpal::Device,
+        config: &cpal::SupportedStreamConfig,
+    ) -> Result<Self> {
+        let stream = open_output(device, config, &consumer, &shared)?;
+        Ok(Self {
+            host,
+            consumer,
+            shared,
+            device_name: device.name().ok(),
+            _stream: stream,
+        })
+    }
+
+    fn follow_default_device(&mut self) {
+        let (device, config) = match default_output(&self.host) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("Failed to query default output device: {e}");
+                return;
+            }
+        };
+        let name = device.name().ok();
+        if name == self.device_name {
+            return;
+        }
+
+        match open_output(&device, &config, &self.consumer, &self.shared) {
+            Ok(stream) => {
+                self.shared.output_spec.set(AudioSpec::of(&config));
+                self._stream = stream;
+                self.device_name = name;
+                eprintln!("Output device switched to {:?}", self.device_name);
+            }
+            Err(e) => eprintln!("Failed to switch output device: {e:#}"),
+        }
+    }
+}
+
 /// キャプチャデバイスの音声をデフォルト出力へパススルーする。shutdownまでブロックする。
 /// 出力デバイスは`OUTPUT_DEVICE_POLL_INTERVAL`ごとにポーリングし、変化していれば再構築する。
 pub fn run(device_keyword: &str, shutdown: Arc<AtomicBool>) -> Result<()> {
     let host = cpal::default_host();
-    let keyword = device_keyword.to_lowercase();
-
-    let input_device = host
-        .input_devices()?
-        .find(|d| {
-            d.name()
-                .map(|n| n.to_lowercase().contains(&keyword))
-                .unwrap_or(false)
-        })
-        .context("Capture audio device not found")?;
+    let input_device = find_input_device(&host, device_keyword)?;
     let input_config = input_device.default_input_config()?;
-    let in_channels = input_config.channels() as usize;
-    let in_rate = input_config.sample_rate().0;
+    let input = AudioSpec::of(&input_config);
 
-    let (initial_device, initial_config) = default_output(&host)?;
-    let shared = Arc::new(Shared::new(OutputSpec::of(&initial_config)));
+    let (output_device, output_config) = default_output(&host)?;
+    let shared = Arc::new(Shared::new(AudioSpec::of(&output_config)));
 
     let waker: Arc<OnceLock<thread::Thread>> = Arc::new(OnceLock::new());
-    let input_ring_samples = in_rate as usize * in_channels * INPUT_RING_MS / 1000;
     let (input_stream, raw_cons) = build_input_stream(
         &input_device,
         &input_config,
-        input_ring_samples,
+        input.samples_for_ms(INPUT_RING_MS),
         Arc::clone(&shared),
         Arc::clone(&waker),
     )?;
@@ -404,63 +456,35 @@ pub fn run(device_keyword: &str, shutdown: Arc<AtomicBool>) -> Result<()> {
     let (out_prod, out_cons) = HeapRb::<f32>::new(OUTPUT_RING_CAPACITY).split();
     let out_cons = Arc::new(Mutex::new(out_cons));
 
-    let worker = Worker::spawn(
-        raw_cons,
-        out_prod,
-        Arc::clone(&shared),
-        in_channels,
-        in_rate,
-    );
+    let worker = Worker::spawn(raw_cons, out_prod, Arc::clone(&shared), input);
     let _ = waker.set(worker.waker());
     input_stream.play()?;
 
-    let mut current_name = initial_device.name().ok();
-    let mut output_stream = build_output_stream(
-        &initial_device,
-        &initial_config,
-        Arc::clone(&out_cons),
-        Arc::clone(&shared),
-    )?;
-    output_stream.play()?;
+    let mut router = OutputRouter::start(host, out_cons, shared, &output_device, &output_config)?;
 
     let mut last_poll = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         thread::sleep(SHUTDOWN_POLL_INTERVAL);
-        if last_poll.elapsed() < OUTPUT_DEVICE_POLL_INTERVAL {
-            continue;
-        }
-        last_poll = Instant::now();
-
-        let (device, config) = match default_output(&host) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to query default output device: {e}");
-                continue;
-            }
-        };
-        let name = device.name().ok();
-        if name == current_name {
-            continue;
-        }
-
-        match build_output_stream(&device, &config, Arc::clone(&out_cons), Arc::clone(&shared)) {
-            Ok(new_stream) => {
-                if let Err(e) = new_stream.play() {
-                    eprintln!("Failed to start new output stream: {e}");
-                    continue;
-                }
-                shared.format.set(OutputSpec::of(&config));
-                output_stream = new_stream;
-                current_name = name;
-                eprintln!("Output device switched to {current_name:?}");
-            }
-            Err(e) => eprintln!("Failed to switch output device: {e}"),
+        if last_poll.elapsed() >= OUTPUT_DEVICE_POLL_INTERVAL {
+            last_poll = Instant::now();
+            router.follow_default_device();
         }
     }
 
-    drop(output_stream);
+    drop(router);
     drop(input_stream);
     Ok(())
+}
+
+fn find_input_device(host: &cpal::Host, keyword: &str) -> Result<cpal::Device> {
+    let keyword = keyword.to_lowercase();
+    host.input_devices()?
+        .find(|d| {
+            d.name()
+                .map(|n| n.to_lowercase().contains(&keyword))
+                .unwrap_or(false)
+        })
+        .context("Capture audio device not found")
 }
 
 fn default_output(host: &cpal::Host) -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
@@ -471,7 +495,26 @@ fn default_output(host: &cpal::Host) -> Result<(cpal::Device, cpal::SupportedStr
     Ok((device, config))
 }
 
+fn stream_config(
+    config: &cpal::SupportedStreamConfig,
+    buffer_size: cpal::BufferSize,
+) -> cpal::StreamConfig {
+    let mut stream_config: cpal::StreamConfig = config.clone().into();
+    stream_config.buffer_size = buffer_size;
+    stream_config
+}
+
 /// 小さいバッファを要求し、拒否されたらデフォルトで作り直す。
+fn with_buffer_fallback<T>(
+    label: &str,
+    attempt: impl Fn(cpal::BufferSize) -> Result<T>,
+) -> Result<T> {
+    attempt(cpal::BufferSize::Fixed(LOW_LATENCY_FRAMES)).or_else(|e| {
+        eprintln!("Fixed {label} buffer unavailable ({e}); using default");
+        attempt(cpal::BufferSize::Default)
+    })
+}
+
 fn build_input_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
@@ -479,22 +522,14 @@ fn build_input_stream(
     shared: Arc<Shared>,
     waker: Arc<OnceLock<thread::Thread>>,
 ) -> Result<(Stream, HeapCons<f32>)> {
-    let attempt = |buffer_size: cpal::BufferSize| -> Result<(Stream, HeapCons<f32>)> {
+    with_buffer_fallback("input", |buffer_size| {
         let (mut prod, cons) = HeapRb::<f32>::new(ring_samples).split();
         let shared = Arc::clone(&shared);
         let waker = Arc::clone(&waker);
-        let mut stream_config: cpal::StreamConfig = config.clone().into();
-        stream_config.buffer_size = buffer_size;
         let stream = device.build_input_stream(
-            &stream_config,
+            &stream_config(config, buffer_size),
             move |data: &[f32], info: &cpal::InputCallbackInfo| {
-                let ts = info.timestamp();
-                if let Some(d) = ts.callback.duration_since(&ts.capture) {
-                    shared
-                        .probe
-                        .input_us
-                        .store(d.as_micros() as u64, Ordering::Relaxed);
-                }
+                shared.probe.record_input(info);
                 shared
                     .in_callback_samples
                     .store(data.len(), Ordering::Relaxed);
@@ -507,36 +542,22 @@ fn build_input_stream(
             None,
         )?;
         Ok((stream, cons))
-    };
-
-    attempt(cpal::BufferSize::Fixed(LOW_LATENCY_FRAMES)).or_else(|e| {
-        eprintln!("Fixed input buffer unavailable ({e}); using default");
-        attempt(cpal::BufferSize::Default)
     })
 }
 
-/// 小さいバッファを要求し、拒否されたらデフォルトで作り直す。
 fn build_output_stream(
     device: &cpal::Device,
     config: &cpal::SupportedStreamConfig,
-    consumer: Arc<Mutex<HeapCons<f32>>>,
-    shared: Arc<Shared>,
+    consumer: &SharedConsumer,
+    shared: &Arc<Shared>,
 ) -> Result<Stream> {
-    let attempt = |buffer_size: cpal::BufferSize| -> Result<Stream> {
-        let consumer = Arc::clone(&consumer);
-        let shared = Arc::clone(&shared);
-        let mut stream_config: cpal::StreamConfig = config.clone().into();
-        stream_config.buffer_size = buffer_size;
+    with_buffer_fallback("output", |buffer_size| {
+        let consumer = Arc::clone(consumer);
+        let shared = Arc::clone(shared);
         let stream = device.build_output_stream(
-            &stream_config,
+            &stream_config(config, buffer_size),
             move |out: &mut [f32], info: &cpal::OutputCallbackInfo| {
-                let ts = info.timestamp();
-                if let Some(d) = ts.playback.duration_since(&ts.callback) {
-                    shared
-                        .probe
-                        .output_us
-                        .store(d.as_micros() as u64, Ordering::Relaxed);
-                }
+                shared.probe.record_output(info);
                 shared
                     .out_callback_samples
                     .store(out.len(), Ordering::Relaxed);
@@ -550,10 +571,16 @@ fn build_output_stream(
             None,
         )?;
         Ok(stream)
-    };
-
-    attempt(cpal::BufferSize::Fixed(LOW_LATENCY_FRAMES)).or_else(|e| {
-        eprintln!("Fixed output buffer unavailable ({e}); using default");
-        attempt(cpal::BufferSize::Default)
     })
+}
+
+fn open_output(
+    device: &cpal::Device,
+    config: &cpal::SupportedStreamConfig,
+    consumer: &SharedConsumer,
+    shared: &Arc<Shared>,
+) -> Result<Stream> {
+    let stream = build_output_stream(device, config, consumer, shared)?;
+    stream.play().context("Failed to start output stream")?;
+    Ok(stream)
 }
