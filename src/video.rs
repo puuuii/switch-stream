@@ -15,7 +15,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use crate::audio::AudioStatus;
 use crate::hardware::{HardwareProfile, VideoSpec};
+use crate::shutdown::Shutdown;
 
 pub type Frame = Vec<Color32>;
 
@@ -41,7 +43,7 @@ impl CaptureStats {
     }
 }
 
-/// 1スロットのチャネルで「常に最新フレームだけ」を配信する送信側。溢れて捨てられたバッファは呼び出し元へ返し再利用させる。
+/// 1スロットのチャネルで「常に最新フレームだけ」を配信する送信側。溢れて捨てられたバッファは呼び出し元へ返す。
 struct LatestFrameSender {
     tx: Sender<Frame>,
     drain: Receiver<Frame>,
@@ -64,7 +66,7 @@ impl LatestFrameSender {
 /// キャプチャスレッドを起動し、最新フレームだけを流す受信側と共有統計を返す。
 pub fn spawn_capture(
     profile: &HardwareProfile,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Shutdown,
 ) -> Result<(Receiver<Frame>, Arc<CaptureStats>, JoinHandle<()>)> {
     let camera = open_camera(profile)?;
     let spec = profile.video;
@@ -110,17 +112,17 @@ fn capture_loop(
     spec: VideoSpec,
     publisher: LatestFrameSender,
     stats: Arc<CaptureStats>,
-    shutdown: Arc<AtomicBool>,
+    shutdown: Shutdown,
 ) {
     let [width, height] = spec.size();
-    // 押し出されて戻ってきたバッファを次のフレームに使い回す(定常状態でのアロケーションを避ける)
+    // UIが遅れて押し出されたバッファだけ再利用できる。通常はテクスチャ更新で消費され毎フレーム確保になる。
     let mut spare: Option<Frame> = None;
 
-    while !shutdown.load(Ordering::Relaxed) {
-        let raw = match camera.frame() {
+    while !shutdown.is_set() {
+        let raw = match camera.frame_raw() {
             Ok(raw) => raw,
             Err(e) => {
-                eprintln!("Capture frame error: {e}");
+                log::warn!("Capture frame error: {e}");
                 thread::sleep(FRAME_ERROR_BACKOFF);
                 continue;
             }
@@ -135,7 +137,7 @@ fn capture_loop(
         let mut pixels = spare
             .take()
             .unwrap_or_else(|| vec![Color32::BLACK; width * height]);
-        decode_yuyv(raw.buffer(), &mut pixels, width);
+        decode_yuyv(&raw, &mut pixels, width);
         spare = publisher.send(pixels);
         if spare.is_some() {
             stats.dropped.fetch_add(1, Ordering::Relaxed);
@@ -186,7 +188,7 @@ fn decode_yuyv(yuyv: &[u8], out: &mut [Color32], width: usize) {
         });
 }
 
-/// オーバーレイ用のFPS計測。一定時間ごとに窓を区切って平均を出す。
+/// FPS計測。一定時間ごとに窓を区切って平均を出す。
 struct Metrics {
     window_start: Instant,
     captured_base: u64,
@@ -206,6 +208,12 @@ impl Metrics {
         }
     }
 
+    fn start_window(&mut self, captured: u64) {
+        self.window_start = Instant::now();
+        self.captured_base = captured;
+        self.displayed = 0;
+    }
+
     fn tick(&mut self, captured: u64) {
         let elapsed = self.window_start.elapsed();
         if elapsed < METRICS_WINDOW {
@@ -214,72 +222,44 @@ impl Metrics {
         let secs = elapsed.as_secs_f32();
         self.capture_fps = (captured - self.captured_base) as f32 / secs;
         self.display_fps = self.displayed as f32 / secs;
-        *self = Self {
-            capture_fps: self.capture_fps,
-            display_fps: self.display_fps,
-            ..Self::new(captured)
-        };
+        self.start_window(captured);
     }
 }
 
-pub struct DisplayApp {
+/// 受信したフレームをテクスチャへ反映して描画する。
+struct VideoView {
     rx: Receiver<Frame>,
-    spec: VideoSpec,
-    stats: Arc<CaptureStats>,
+    size: [usize; 2],
     texture: Option<TextureHandle>,
-    show_overlay: bool,
-    paused: bool,
-    metrics: Metrics,
 }
 
-impl DisplayApp {
-    pub fn new(rx: Receiver<Frame>, spec: VideoSpec, stats: Arc<CaptureStats>) -> Self {
+impl VideoView {
+    fn new(rx: Receiver<Frame>, spec: VideoSpec) -> Self {
         Self {
             rx,
-            spec,
-            stats,
+            size: spec.size(),
             texture: None,
-            show_overlay: false,
-            paused: false,
-            metrics: Metrics::new(0),
         }
     }
 
-    /// 最小化中は描画とデコードを止め、復帰時に計測をリセットする。
-    fn handle_minimized(&mut self, ctx: &egui::Context, minimized: bool, captured: u64) -> bool {
-        self.stats
-            .display_active
-            .store(!minimized, Ordering::Relaxed);
-        if minimized {
-            self.paused = true;
-            ctx.request_repaint_after(MINIMIZED_POLL_INTERVAL);
-        } else if self.paused {
-            self.paused = false;
-            self.metrics = Metrics::new(captured);
-        }
-        minimized
-    }
-
-    fn upload_latest_frame(&mut self, ctx: &egui::Context) {
-        // 溜まっているフレームは最新だけ使う。
+    /// 溜まっているフレームは最新だけ使う。更新があればtrueを返す。
+    fn upload_latest(&mut self, ctx: &egui::Context) -> bool {
         let Some(pixels) = self.rx.try_iter().last() else {
-            return;
+            return false;
         };
-        self.metrics.displayed += 1;
-
-        let size = self.spec.size();
         let image = ColorImage {
-            size,
-            source_size: Vec2::new(size[0] as f32, size[1] as f32),
+            size: self.size,
+            source_size: Vec2::new(self.size[0] as f32, self.size[1] as f32),
             pixels,
         };
         match &mut self.texture {
             Some(tex) => tex.set(image, TEXTURE_OPTIONS),
             None => self.texture = Some(ctx.load_texture("video_frame", image, TEXTURE_OPTIONS)),
         }
+        true
     }
 
-    fn draw_video(&self, ctx: &egui::Context) {
+    fn draw(&self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| match &self.texture {
@@ -291,17 +271,68 @@ impl DisplayApp {
                 }
             });
     }
+}
 
-    fn draw_overlay(&self, ctx: &egui::Context) {
-        let text = format!(
-            "Display: {:.1} fps\nCapture: {:.1} fps\nDropped: {}\nSource:  {}x{} @{}",
+/// F2で切り替える統計オーバーレイ。
+struct Overlay {
+    visible: bool,
+    metrics: Metrics,
+}
+
+impl Overlay {
+    fn new() -> Self {
+        Self {
+            visible: false,
+            metrics: Metrics::new(0),
+        }
+    }
+
+    fn toggle(&mut self) {
+        self.visible = !self.visible;
+    }
+
+    fn frame_displayed(&mut self) {
+        self.metrics.displayed += 1;
+    }
+
+    fn tick(&mut self, captured: u64) {
+        self.metrics.tick(captured);
+    }
+
+    fn restart(&mut self, captured: u64) {
+        self.metrics = Metrics::new(captured);
+    }
+
+    fn draw(
+        &self,
+        ctx: &egui::Context,
+        stats: &CaptureStats,
+        audio: &AudioStatus,
+        spec: VideoSpec,
+    ) {
+        if !self.visible {
+            return;
+        }
+        let mut text = format!(
+            "Display: {:.1} fps\nCapture: {:.1} fps\nDropped: {}\nSource:  {}x{} @{}\nAudio:   in {:.1} ms / out {:.1} ms",
             self.metrics.display_fps,
             self.metrics.capture_fps,
-            self.stats.dropped.load(Ordering::Relaxed),
-            self.spec.width,
-            self.spec.height,
-            self.spec.fps,
+            stats.dropped.load(Ordering::Relaxed),
+            spec.width,
+            spec.height,
+            spec.fps,
+            audio.input_latency_ms(),
+            audio.output_latency_ms(),
         );
+        if let Some(err) = audio.error() {
+            text = format!("{text}\n{err}");
+        }
+        let color = if audio.error().is_some() {
+            Color32::LIGHT_RED
+        } else {
+            Color32::WHITE
+        };
+
         egui::Area::new(egui::Id::new("stats_overlay"))
             .order(egui::Order::Foreground)
             .anchor(egui::Align2::LEFT_TOP, [8.0, 8.0])
@@ -312,9 +343,50 @@ impl DisplayApp {
                     .corner_radius(4.0)
                     .inner_margin(8.0)
                     .show(ui, |ui| {
-                        ui.label(RichText::new(text).monospace().color(Color32::WHITE));
+                        ui.label(RichText::new(text).monospace().color(color));
                     });
             });
+    }
+}
+
+pub struct DisplayApp {
+    view: VideoView,
+    overlay: Overlay,
+    spec: VideoSpec,
+    stats: Arc<CaptureStats>,
+    audio: Arc<AudioStatus>,
+    paused: bool,
+}
+
+impl DisplayApp {
+    pub fn new(
+        rx: Receiver<Frame>,
+        spec: VideoSpec,
+        stats: Arc<CaptureStats>,
+        audio: Arc<AudioStatus>,
+    ) -> Self {
+        Self {
+            view: VideoView::new(rx, spec),
+            overlay: Overlay::new(),
+            spec,
+            stats,
+            audio,
+            paused: false,
+        }
+    }
+
+    /// 最小化中はデコードを止め、復帰時に計測をリセットする。
+    fn set_minimized(&mut self, ctx: &egui::Context, minimized: bool, captured: u64) {
+        self.stats
+            .display_active
+            .store(!minimized, Ordering::Relaxed);
+        if minimized {
+            self.paused = true;
+            ctx.request_repaint_after(MINIMIZED_POLL_INTERVAL);
+        } else if self.paused {
+            self.paused = false;
+            self.overlay.restart(captured);
+        }
     }
 }
 
@@ -322,20 +394,21 @@ impl eframe::App for DisplayApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
         let captured = self.stats.captured.load(Ordering::Relaxed);
-        if self.handle_minimized(ctx, minimized, captured) {
+        self.set_minimized(ctx, minimized, captured);
+        if minimized {
             return;
         }
         ctx.request_repaint();
 
         if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
-            self.show_overlay = !self.show_overlay;
+            self.overlay.toggle();
         }
 
-        self.upload_latest_frame(ctx);
-        self.metrics.tick(captured);
-        self.draw_video(ctx);
-        if self.show_overlay {
-            self.draw_overlay(ctx);
+        if self.view.upload_latest(ctx) {
+            self.overlay.frame_displayed();
         }
+        self.overlay.tick(captured);
+        self.view.draw(ctx);
+        self.overlay.draw(ctx, &self.stats, &self.audio, self.spec);
     }
 }

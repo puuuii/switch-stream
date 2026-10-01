@@ -1,32 +1,26 @@
 mod audio;
 mod hardware;
+mod shutdown;
 mod video;
 
 use hardware::HardwareProfile;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
-
-fn spawn_audio(device_keyword: &'static str, shutdown: Arc<AtomicBool>) -> JoinHandle<()> {
-    thread::spawn(move || {
-        if let Err(e) = audio::run(device_keyword, shutdown) {
-            eprintln!("Audio pipeline error: {e}");
-        }
-    })
-}
+use shutdown::Shutdown;
+use std::thread::JoinHandle;
 
 fn join_thread(name: &str, handle: JoinHandle<()>) {
     if let Err(e) = handle.join() {
-        eprintln!("{name} thread panicked: {e:?}");
+        log::error!("{name} thread panicked: {e:?}");
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let profile = HardwareProfile::AVERMEDIA_LIVE_GAMER_MINI_GC311;
-    let shutdown = Arc::new(AtomicBool::new(false));
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let (rx, stats, capture_handle) = video::spawn_capture(&profile, Arc::clone(&shutdown))?;
-    let audio_handle = spawn_audio(profile.audio_device_keyword, Arc::clone(&shutdown));
+    let profile = HardwareProfile::AVERMEDIA_LIVE_GAMER_MINI_GC311;
+    let shutdown = Shutdown::new();
+
+    let (rx, stats, capture_handle) = video::spawn_capture(&profile, shutdown.clone())?;
+    let (audio_status, audio_handle) = audio::spawn(profile.audio_device_keyword, shutdown.clone());
 
     let [width, height] = profile.video.size();
     let options = eframe::NativeOptions {
@@ -37,10 +31,17 @@ fn main() -> anyhow::Result<()> {
     let result = eframe::run_native(
         "Switch Capture",
         options,
-        Box::new(move |_cc| Ok(Box::new(video::DisplayApp::new(rx, profile.video, stats)))),
+        Box::new(move |_cc| {
+            Ok(Box::new(video::DisplayApp::new(
+                rx,
+                profile.video,
+                stats,
+                audio_status,
+            )))
+        }),
     );
 
-    shutdown.store(true, Ordering::Relaxed);
+    shutdown.trigger();
     join_thread("Capture", capture_handle);
     join_thread("Audio", audio_handle);
 
