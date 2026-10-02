@@ -14,4 +14,3 @@ log = "0.4.34"
 nokhwa = { version = "0.10", features = ["input-native", "output-threaded"] }
 rayon = "1"
 ringbuf = "0.4"
-rubato = "5.0.0"
