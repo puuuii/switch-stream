@@ -23,9 +23,21 @@ pub struct HardwareProfile {
 }
 
 impl HardwareProfile {
+    #[allow(dead_code)]
     pub const AVERMEDIA_LIVE_GAMER_MINI_GC311: Self = Self {
         audio_device_keyword: "gc311",
         video_device_keyword: "streamline",
+        video: VideoSpec {
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            frame_format: FrameFormat::YUYV,
+        },
+    };
+
+    pub const NEARSTREAM_CCD10: Self = Self {
+        audio_device_keyword: "nearstream",
+        video_device_keyword: "nearstream",
         video: VideoSpec {
             width: 1920,
             height: 1080,

@@ -18,7 +18,7 @@ fn join_thread(name: &str, handle: JoinHandle<()>) {
 fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let profile = HardwareProfile::AVERMEDIA_LIVE_GAMER_MINI_GC311;
+    let profile = HardwareProfile::NEARSTREAM_CCD10;
     let shutdown = Shutdown::new();
 
     let (rx, stats, capture_handle) = video::spawn_capture(&profile, shutdown.clone())?;
