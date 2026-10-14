@@ -261,10 +261,17 @@ impl VideoView {
 
     fn draw(&self, ctx: &egui::Context) {
         egui::CentralPanel::default()
-            .frame(egui::Frame::NONE)
+            .frame(egui::Frame::NONE.fill(Color32::BLACK))
             .show(ctx, |ui| match &self.texture {
                 Some(tex) => {
-                    ui.add(egui::Image::new(tex).fit_to_exact_size(ui.available_size()));
+                    // 縦横比を保ったまま中央に収める。
+                    ui.centered_and_justified(|ui| {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .maintain_aspect_ratio(true)
+                                .fit_to_exact_size(ui.available_size()),
+                        );
+                    });
                 }
                 None => {
                     ui.label("Waiting for video...");
@@ -402,6 +409,10 @@ impl eframe::App for DisplayApp {
 
         if ctx.input(|i| i.key_pressed(egui::Key::F2)) {
             self.overlay.toggle();
+        }
+        if ctx.input(|i| i.key_pressed(egui::Key::F11)) {
+            let fullscreen = ctx.input(|i| i.viewport().fullscreen.unwrap_or(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(!fullscreen));
         }
 
         if self.view.upload_latest(ctx) {
